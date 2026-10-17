@@ -128,6 +128,11 @@ struct ImConfig {
 
 	float fbViewerZoom = 1.0f;
 
+	// Touch / phone usability. Saved in imdebugger.ini ([Settings]); defaults to on for phones and tablets.
+	bool touchMode = false;
+	// Search text for the "Windows" quick menu. Not saved.
+	char windowFilter[64]{};
+
 
 	// We use a separate ini file from the main PPSSPP config.
 	void LoadConfig(const Path &iniFile);

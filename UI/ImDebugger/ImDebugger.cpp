@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 
 
 #include "ext/imgui/imgui_internal.h"
@@ -76,6 +77,249 @@
 #include "UI/PauseScreen.h"
 
 static ImVec4 g_normalTextColor;
+
+// BEGIN ImDebugger touch/usability helpers
+
+// One row per debugger window, so that the "Windows" quick menu, the layouts and "Close all"
+// don't need their own copy of the list.
+struct ImWindowEntry {
+	const char *category;
+	const char *label;
+	bool *open;
+	bool needsGame;  // Only drawn while a game is loaded, same as in the regular menus.
+};
+
+static const int MAX_WINDOW_ENTRIES = 64;
+
+static int BuildWindowList(ImConfig &cfg, ImWindowEntry *out) {
+	int n = 0;
+	auto add = [&](const char *category, const char *label, bool *open, bool needsGame = true) {
+		if (n < MAX_WINDOW_ENTRIES) {
+			out[n++] = ImWindowEntry{ category, label, open, needsGame };
+		}
+	};
+	add("Core", "Scheduler", &cfg.schedulerOpen);
+	add("Core", "Time", &cfg.timeOpen);
+	add("CPU", "CPU debugger", &cfg.disasmOpen);
+	add("CPU", "GPR regs", &cfg.gprOpen);
+	add("CPU", "FPR regs", &cfg.fprOpen);
+	add("CPU", "VFPU regs", &cfg.vfpuOpen);
+	add("CPU", "Callstacks", &cfg.callstackOpen);
+	add("CPU", "Breakpoints", &cfg.breakpointsOpen);
+	add("CPU", "Watch", &cfg.watchOpen);
+	add("CPU", "JIT viewer", &cfg.jitViewerOpen);
+	add("Symbols", "Symbol browser", &cfg.symbolsOpen);
+	add("Memory", "Memory 1", &cfg.memViewOpen[0]);
+	add("Memory", "Memory 2", &cfg.memViewOpen[1]);
+	add("Memory", "Memory 3", &cfg.memViewOpen[2]);
+	add("Memory", "Memory 4", &cfg.memViewOpen[3]);
+	add("Memory", "Memory Dumper", &cfg.memDumpOpen);
+	add("OS HLE", "HLE module browser", &cfg.hleModulesOpen);
+	add("OS HLE", "File System Browser", &cfg.filesystemBrowserOpen);
+	add("OS HLE", "Kernel Objects", &cfg.kernelObjectsOpen);
+	add("OS HLE", "Threads", &cfg.threadsOpen);
+	add("OS HLE", "Modules", &cfg.modulesOpen);
+	add("OS HLE", "Utility Modules", &cfg.utilityModulesOpen);
+	add("Graphics", "GE Debugger", &cfg.geDebuggerOpen);
+	add("Graphics", "GE State", &cfg.geStateOpen);
+	add("Graphics", "GE Vertices", &cfg.geVertsOpen);
+	add("Graphics", "Display Output", &cfg.displayOpen);
+	add("Graphics", "Textures", &cfg.texturesOpen);
+	add("Graphics", "Framebuffers", &cfg.framebuffersOpen);
+	add("Graphics", "Pixel Viewer", &cfg.pixelViewerOpen);
+	add("Audio/Video", "SasAudio mixer", &cfg.sasAudioOpen);
+	add("Audio/Video", "Raw audio channels", &cfg.audioChannelsOpen);
+	add("Audio/Video", "AV Decoder contexts", &cfg.mediaDecodersOpen);
+	add("Audio/Video", "Audio output / buffer", &cfg.audioOutOpen);
+	add("Network", "ApCtl", &cfg.apctlOpen);
+	add("Network", "Sockets", &cfg.socketsOpen);
+	add("Network", "NP", &cfg.npOpen);
+	add("Network", "AdHoc", &cfg.adhocOpen);
+	add("Tools", "Lua Console", &cfg.luaConsoleOpen, false);
+	add("Tools", "Log", &cfg.logOpen, false);
+	add("Tools", "Log channels", &cfg.logConfigOpen, false);
+	add("Tools", "Debug stats", &cfg.debugStatsOpen);
+	add("Tools", "ParamSFO viewer", &cfg.paramSFOOpen);
+	add("Tools", "Struct viewer", &cfg.structViewerOpen, false);
+	add("Tools", "Atrac Tool", &cfg.atracToolOpen);
+	add("Misc", "PPSSPP Internals", &cfg.internalsOpen, false);
+	add("Misc", "Dear ImGui Demo", &cfg.demoOpen, false);
+	add("Misc", "Dear ImGui Style editor", &cfg.styleEditorOpen, false);
+	return n;
+}
+
+static bool ContainsNoCase(const char *haystack, const char *needle) {
+	if (!*needle) {
+		return true;
+	}
+	for (; *haystack; haystack++) {
+		const char *h = haystack;
+		const char *n = needle;
+		while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+			h++;
+			n++;
+		}
+		if (!*n) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void CloseAllWindows(ImConfig &cfg) {
+	ImWindowEntry entries[MAX_WINDOW_ENTRIES];
+	const int count = BuildWindowList(cfg, entries);
+	for (int i = 0; i < count; i++) {
+		*entries[i].open = false;
+	}
+}
+
+// Opens a small useful set of windows in one tap. Replaces whatever is open now.
+static void ApplyLayout(ImConfig &cfg, int layout) {
+	CloseAllWindows(cfg);
+	switch (layout) {
+	case 0:  // CPU
+		cfg.disasmOpen = true;
+		cfg.gprOpen = true;
+		break;
+	case 1:  // Graphics
+		cfg.geDebuggerOpen = true;
+		cfg.geStateOpen = true;
+		break;
+	case 2:  // Memory
+		cfg.memViewOpen[0] = true;
+		cfg.watchOpen = true;
+		break;
+	case 3:  // Logging
+		cfg.logOpen = true;
+		cfg.logConfigOpen = true;
+		break;
+	default:
+		break;
+	}
+}
+
+// Search box, layouts and "close all". Replaces hunting through ten submenus on a small screen.
+static void DrawWindowsMenu(ImConfig &cfg) {
+	if (!ImGui::BeginMenu("Windows###windowsmenu")) {
+		return;
+	}
+	const bool inited = PSP_IsInited();
+
+	ImGui::InputTextWithHint("##windowfilter", "Search windows...", cfg.windowFilter, sizeof(cfg.windowFilter));
+
+	ImWindowEntry entries[MAX_WINDOW_ENTRIES];
+	const int count = BuildWindowList(cfg, entries);
+	if (cfg.windowFilter[0]) {
+		bool any = false;
+		for (int i = 0; i < count; i++) {
+			const ImWindowEntry &e = entries[i];
+			if (!ContainsNoCase(e.label, cfg.windowFilter) && !ContainsNoCase(e.category, cfg.windowFilter)) {
+				continue;
+			}
+			any = true;
+			ImGui::BeginDisabled(e.needsGame && !inited);
+			ImGui::MenuItem(e.label, e.category, e.open);
+			ImGui::EndDisabled();
+		}
+		if (!any) {
+			ImGui::TextDisabled("No matching windows");
+		}
+	} else {
+		ImGui::TextDisabled("Type to find any window");
+	}
+
+	ImGui::Separator();
+	if (ImGui::BeginMenu("Layouts")) {
+		ImGui::BeginDisabled(!inited);
+		if (ImGui::MenuItem("CPU: disassembly + registers")) {
+			ApplyLayout(cfg, 0);
+		}
+		if (ImGui::MenuItem("Graphics: GE debugger + state")) {
+			ApplyLayout(cfg, 1);
+		}
+		if (ImGui::MenuItem("Memory: viewer + watch")) {
+			ApplyLayout(cfg, 2);
+		}
+		ImGui::EndDisabled();
+		if (ImGui::MenuItem("Logging: log + channels")) {
+			ApplyLayout(cfg, 3);
+		}
+		ImGui::EndMenu();
+	}
+	if (ImGui::MenuItem("Close all windows")) {
+		CloseAllWindows(cfg);
+	}
+	ImGui::EndMenu();
+}
+
+static void DrawRunBreakItems(CoreState coreState) {
+	switch (coreState) {
+	case CoreState::CORE_STEPPING_CPU:
+		if (ImGui::MenuItem(">> Run")) {
+			Core_Resume();
+		}
+		break;
+	case CoreState::CORE_RUNNING_CPU:
+		if (ImGui::MenuItem("|| Break")) {
+			Core_Break(BreakReason::DebugBreak);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+// Small colored state indicator at the end of the menu bar. Skipped if there's no room for it.
+static void DrawCoreStatus(CoreState coreState) {
+	char text[48];
+	ImVec4 color;
+	if (!PSP_IsInited()) {
+		snprintf(text, sizeof(text), "No game");
+		color = ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
+	} else if (coreState == CoreState::CORE_STEPPING_CPU) {
+		snprintf(text, sizeof(text), "Paused @ %08x", currentMIPS->pc);
+		color = ImVec4(1.0f, 0.7f, 0.2f, 1.0f);
+	} else if (coreState == CoreState::CORE_RUNNING_CPU) {
+		snprintf(text, sizeof(text), "Running");
+		color = ImVec4(0.4f, 0.9f, 0.4f, 1.0f);
+	} else {
+		return;
+	}
+	const float width = ImGui::CalcTextSize(text).x + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+	if (ImGui::GetContentRegionAvail().x < width) {
+		return;
+	}
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextColored(color, "%s", text);
+}
+
+// Scales hit areas up for fingers, relative to the current style so it keeps working with whatever DPI
+// scaling the backend applied. Everything is popped again when this goes out of scope.
+struct TouchStyleScope {
+	explicit TouchStyleScope(bool enable) {
+		if (!enable) {
+			return;
+		}
+		const ImGuiStyle &st = ImGui::GetStyle();
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(st.FramePadding.x * 2.0f, st.FramePadding.y * 2.5f));
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(st.ItemSpacing.x * 1.5f, st.ItemSpacing.y * 2.0f));
+		ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, st.ScrollbarSize * 1.8f);
+		ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, st.GrabMinSize * 1.8f);
+		count_ = 4;
+	}
+	~TouchStyleScope() {
+		if (count_) {
+			ImGui::PopStyleVar(count_);
+		}
+	}
+	TouchStyleScope(const TouchStyleScope &) = delete;
+	TouchStyleScope &operator=(const TouchStyleScope &) = delete;
+private:
+	int count_ = 0;
+};
+
+// END ImDebugger touch/usability helpers
 
 void ShowInMemoryViewerMenuItem(uint32_t addr, ImControl &control) {
 	if (ImGui::BeginMenu("Show in memory viewer")) {
@@ -2560,6 +2804,12 @@ void ImDebugger::Frame(MIPSDebugInterface *mipsDebug, GPUCommon *gpuDebug, Draw:
 		return;
 	}
 
+	// Touch mode: bigger hit areas, and windows only move by their title bar, so dragging inside a
+	// window scrolls or adjusts instead of dragging the whole window around.
+	ImGui::GetIO().ConfigWindowsMoveFromTitleBarOnly = cfg_.touchMode;
+	// Not while the style editor is open, since it edits the live style and our pop would undo its edits.
+	TouchStyleScope touchStyle(cfg_.touchMode && !cfg_.styleEditorOpen);
+
 	// TODO: Pass mipsDebug in where needed instead.
 	g_disassemblyManager.setCpu(mipsDebug);
 	disasm_.View().setDebugger(mipsDebug);
@@ -2589,289 +2839,294 @@ void ImDebugger::Frame(MIPSDebugInterface *mipsDebug, GPUCommon *gpuDebug, Draw:
 	ImControl control{};
 
 	if (ImGui::BeginMainMenuBar()) {
-		if (ImGui::BeginMenu("File")) {
-			if (ImGui::MenuItem("Load")) {
-				System_BrowseForFile(reqToken_, "Load", BrowseFileType::SAVE_STATE, [](std::string_view responseString, int) {
-					Path path(responseString);
-					System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, path.ToString());
-				});
-			}
-			if (ImGui::MenuItem("Load XMB (VSH)")) {
-				System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, (g_Config.nandRootDirectory / "flash0/vsh/module/vshmain.prx").ToString());
-			}
-			if (ImGui::MenuItem("Open directory...")) {
-				System_BrowseForFolder(reqToken_, "Load", Path(), [](std::string_view value, int) {
-					System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, value);
-				});
-			}
-			if (System_GetPropertyBool(SYSPROP_HAS_OPEN_DIRECTORY)) {
-				if (ImGui::MenuItem("Open memory stick")) {
-					System_LaunchUrl(LaunchUrlType::LOCAL_FOLDER, g_Config.memStickDirectory.ToString());
-				}
-			}
-			// TODO: Add "Open new instance"
-			if (allowSaveStates) {
-				ImGui::Separator();
-				if (ImGui::MenuItem(StringFromFormat("Load state (%d)", g_Config.iCurrentStateSlot).c_str(), "F4")) {
-					SaveState::LoadSlot(SaveState::GetGamePrefix(g_paramSFO), g_Config.iCurrentStateSlot, ShowMessageAfterSaveStateAction);
-				}
-				if (ImGui::MenuItem(StringFromFormat("Save state (%d)", g_Config.iCurrentStateSlot).c_str(), "F2")) {
-					SaveState::SaveSlot(SaveState::GetGamePrefix(g_paramSFO), g_Config.iCurrentStateSlot, ShowMessageAfterSaveStateAction);
-				}
-				if (ImGui::MenuItem("Previous slot")) {
-					SaveState::PrevSlot();
-				}
-				if (ImGui::MenuItem("Next slot", "F3")) {
-					SaveState::NextSlot();
-				}
-				ImGui::Separator();
-				if (ImGui::MenuItem("Load state from file...")) {
-					System_BrowseForFile(reqToken_, "Load", BrowseFileType::SAVE_STATE, [](std::string_view fn, int) {
-						SaveState::Load(Path(fn), -1, ShowMessageAfterSaveStateAction);
+		// Phone-friendly layout: the full menu bar is wider than a phone screen, so everything except
+		// the essentials is folded into a single "Menu" entry.
+		const bool compact = cfg_.touchMode;
+		if (compact) {
+			DrawRunBreakItems(coreState);
+			DrawWindowsMenu(cfg_);
+		}
+		const bool showMainMenus = !compact || ImGui::BeginMenu("Menu");
+		if (showMainMenus) {
+			if (ImGui::BeginMenu("File")) {
+				if (ImGui::MenuItem("Load")) {
+					System_BrowseForFile(reqToken_, "Load", BrowseFileType::SAVE_STATE, [](std::string_view responseString, int) {
+						Path path(responseString);
+						System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, path.ToString());
 					});
 				}
-				if (ImGui::MenuItem("Save state to file...")) {
-					System_BrowseForFile(reqToken_, "Save", BrowseFileType::SAVE_STATE, [](std::string_view fn, int) {
-						SaveState::Save(Path(fn), -1, ShowMessageAfterSaveStateAction);
+				if (ImGui::MenuItem("Load XMB (VSH)")) {
+					System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, (g_Config.nandRootDirectory / "flash0/vsh/module/vshmain.prx").ToString());
+				}
+				if (ImGui::MenuItem("Open directory...")) {
+					System_BrowseForFolder(reqToken_, "Load", Path(), [](std::string_view value, int) {
+						System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, value);
 					});
 				}
-			} else {
-				ImGui::BeginDisabled();
-				ImGui::Text("Save states are not available");
-				ImGui::EndDisabled();
-			}
-			ImGui::Separator();
-			if (ImGui::MenuItem("Exit")) {
-				System_ExitApp();
-			}
-			ImGui::EndMenu();
-		}
-
-		if (ImGui::BeginMenu("Emulation")) {
-			if (ImGui::MenuItem("Pause")) {
-				System_PostUIMessage(UIMessage::REQUEST_GAME_PAUSE);
-			}
-			if (ImGui::MenuItem("Stop")) {
-				System_PostUIMessage(UIMessage::REQUEST_GAME_STOP);
-			}
-			if (ImGui::MenuItem("Reset")) {
-				System_PostUIMessage(UIMessage::REQUEST_GAME_RESET);
-			}
-			ImGui::Separator();
-			ImGui::EndMenu();
-		}
-
-		if (ImGui::BeginMenu("View")) {
-			if (PSP_IsInited()) {
-				ImGui::BeginDisabled();  // Can't change this setting while running.
-			}
-			ImGui::MenuItem("Show DevMenu button", nullptr, &g_Config.bShowDeveloperMenu);
-			if (PSP_IsInited()) {
-				ImGui::EndDisabled();
-			}
-			ImGui::EndMenu();
-		}
-
-		if (ImGui::BeginMenu("Debug")) {
-			if (PSP_IsInited()) {
-				switch (coreState) {
-				case CoreState::CORE_STEPPING_CPU:
-					if (ImGui::MenuItem("Run")) {
-						Core_Resume();
+				if (System_GetPropertyBool(SYSPROP_HAS_OPEN_DIRECTORY)) {
+					if (ImGui::MenuItem("Open memory stick")) {
+						System_LaunchUrl(LaunchUrlType::LOCAL_FOLDER, g_Config.memStickDirectory.ToString());
+					}
+				}
+				// TODO: Add "Open new instance"
+				if (allowSaveStates) {
+					ImGui::Separator();
+					if (ImGui::MenuItem(StringFromFormat("Load state (%d)", g_Config.iCurrentStateSlot).c_str(), "F4")) {
+						SaveState::LoadSlot(SaveState::GetGamePrefix(g_paramSFO), g_Config.iCurrentStateSlot, ShowMessageAfterSaveStateAction);
+					}
+					if (ImGui::MenuItem(StringFromFormat("Save state (%d)", g_Config.iCurrentStateSlot).c_str(), "F2")) {
+						SaveState::SaveSlot(SaveState::GetGamePrefix(g_paramSFO), g_Config.iCurrentStateSlot, ShowMessageAfterSaveStateAction);
+					}
+					if (ImGui::MenuItem("Previous slot")) {
+						SaveState::PrevSlot();
+					}
+					if (ImGui::MenuItem("Next slot", "F3")) {
+						SaveState::NextSlot();
 					}
 					ImGui::Separator();
-					break;
-				case CoreState::CORE_RUNNING_CPU:
-					if (ImGui::MenuItem("Break")) {
-						Core_Break(BreakReason::DebugBreak);
+					if (ImGui::MenuItem("Load state from file...")) {
+						System_BrowseForFile(reqToken_, "Load", BrowseFileType::SAVE_STATE, [](std::string_view fn, int) {
+							SaveState::Load(Path(fn), -1, ShowMessageAfterSaveStateAction);
+						});
+					}
+					if (ImGui::MenuItem("Save state to file...")) {
+						System_BrowseForFile(reqToken_, "Save", BrowseFileType::SAVE_STATE, [](std::string_view fn, int) {
+							SaveState::Save(Path(fn), -1, ShowMessageAfterSaveStateAction);
+						});
+					}
+				} else {
+					ImGui::BeginDisabled();
+					ImGui::Text("Save states are not available");
+					ImGui::EndDisabled();
+				}
+				ImGui::Separator();
+				if (ImGui::MenuItem("Exit")) {
+					System_ExitApp();
+				}
+				ImGui::EndMenu();
+			}
+
+			if (ImGui::BeginMenu("Emulation")) {
+				if (ImGui::MenuItem("Pause")) {
+					System_PostUIMessage(UIMessage::REQUEST_GAME_PAUSE);
+				}
+				if (ImGui::MenuItem("Stop")) {
+					System_PostUIMessage(UIMessage::REQUEST_GAME_STOP);
+				}
+				if (ImGui::MenuItem("Reset")) {
+					System_PostUIMessage(UIMessage::REQUEST_GAME_RESET);
+				}
+				ImGui::Separator();
+				ImGui::EndMenu();
+			}
+
+			if (ImGui::BeginMenu("View")) {
+				ImGui::MenuItem("Touch-friendly mode", nullptr, &cfg_.touchMode);
+				if (PSP_IsInited()) {
+					ImGui::BeginDisabled();  // Can't change this setting while running.
+				}
+				ImGui::MenuItem("Show DevMenu button", nullptr, &g_Config.bShowDeveloperMenu);
+				if (PSP_IsInited()) {
+					ImGui::EndDisabled();
+				}
+				ImGui::EndMenu();
+			}
+
+			if (ImGui::BeginMenu("Debug")) {
+				if (PSP_IsInited()) {
+					switch (coreState) {
+					case CoreState::CORE_STEPPING_CPU:
+						if (ImGui::MenuItem("Run")) {
+							Core_Resume();
+						}
+						ImGui::Separator();
+						break;
+					case CoreState::CORE_RUNNING_CPU:
+						if (ImGui::MenuItem("Break")) {
+							Core_Break(BreakReason::DebugBreak);
+						}
+						ImGui::Separator();
+						break;
+					default:
+						break;
+					}
+				}
+				ImGui::MenuItemInverted("Break on load", nullptr, &g_Config.bAutoRun);
+				ImGui::MenuItem("Ignore bad memory accesses", nullptr, &g_Config.bIgnoreBadMemAccess);
+				ImGui::MenuItem("Break on frame timeout", nullptr, &g_Config.bBreakOnFrameTimeout);
+				ImGui::MenuItem("Fast memory", nullptr, &g_Config.bFastMemory);
+				ImGui::MenuItem("Auto save/load symbols (PSP/SYSTEM/SYMBOLS)", nullptr, &g_Config.bAutoSaveLoadSymbols);
+				ImGui::Separator();
+				if (ImGui::MenuItem("Take screenshot")) {
+					TakeUserScreenshot();
+				}
+				ImGui::MenuItem("Save screenshot as .png", nullptr, &g_Config.bScreenshotsAsPNG);
+				if (ImGui::MenuItem("Restart graphics")) {
+					System_PostUIMessage(UIMessage::RESTART_GRAPHICS);
+				}
+				if (System_GetPropertyBool(SYSPROP_HAS_TEXT_CLIPBOARD)) {
+					if (ImGui::MenuItem("Copy memory base to clipboard")) {
+						System_CopyStringToClipboard(StringFromFormat("%016llx", (uint64_t)(uintptr_t)Memory::base));
+					}
+				}
+				ImGui::Separator();
+				if (ImGui::MenuItem("Open web debugger")) {
+					OpenWebDebugger();
+				}
+				ImGui::Separator();
+				if (ImGui::MenuItem("Close")) {
+					g_Config.bShowImDebugger = false;
+				}
+				ImGui::EndMenu();
+			}
+
+			/*
+			if (ImGui::BeginMenu("Options")) {
+				ImGui::EndMenu();
+			}
+			*/
+
+			if (showDebugger) {
+				if (ImGui::BeginMenu("Core")) {
+					ImGui::MenuItem("Scheduler", nullptr, &cfg_.schedulerOpen);
+					ImGui::MenuItem("Time", nullptr, &cfg_.timeOpen);
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("CPU")) {
+					ImGui::MenuItem("CPU debugger", nullptr, &cfg_.disasmOpen);
+					ImGui::MenuItem("GPR regs", nullptr, &cfg_.gprOpen);
+					ImGui::MenuItem("FPR regs", nullptr, &cfg_.fprOpen);
+					ImGui::MenuItem("VFPU regs", nullptr, &cfg_.vfpuOpen);
+					ImGui::Separator();
+					ImGui::MenuItem("Callstacks", nullptr, &cfg_.callstackOpen);
+					ImGui::MenuItem("Breakpoints", nullptr, &cfg_.breakpointsOpen);
+					ImGui::MenuItem("Watch", nullptr, &cfg_.watchOpen);
+					ImGui::MenuItem("JIT viewer", nullptr, &cfg_.jitViewerOpen);
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("Symbols")) {
+					ImGui::MenuItem("Symbol browser", nullptr, &cfg_.symbolsOpen);
+					ImGui::Separator();
+
+					if (ImGui::MenuItem("Load .ppmap...")) {
+						System_BrowseForFile(reqToken_, "Load PPSSPP symbol map", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
+							Path path(responseString);
+							if (!g_symbolMap->LoadSymbolMap(path)) {
+								ERROR_LOG(Log::Common, "Failed to load symbol map");
+							}
+						});
+					}
+					if (ImGui::MenuItem("Save .ppmap...")) {
+						System_BrowseForFileSave(reqToken_, "Save PPSSPP symbol map", "symbols.ppmap", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
+							Path path(responseString);
+							if (!g_symbolMap->SaveSymbolMap(path)) {
+								ERROR_LOG(Log::Common, "Failed to save symbol map");
+							}
+						});
+					}
+					if (ImGui::MenuItem("Load No$ .sym...")) {
+						System_BrowseForFile(reqToken_, "Load No$ symbol map", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
+							Path path(responseString);
+							if (!g_symbolMap->LoadNocashSym(path)) {
+								ERROR_LOG(Log::Common, "Failed to load No$ symbol map");
+							}
+						});
+					}
+					if (ImGui::MenuItem("Save No$ .sym...")) {
+						System_BrowseForFileSave(reqToken_, "Save No$ symbol map", "symbols.sym", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
+							Path path(responseString);
+							if (!g_symbolMap->SaveNocashSym(path)) {
+								ERROR_LOG(Log::Common, "Failed to save No$ symbol map");
+							}
+						});
 					}
 					ImGui::Separator();
-					break;
-				default:
-					break;
+					ImGui::MenuItem("Compress .ppmap files", nullptr, &g_Config.bCompressSymbols);
+					if (ImGui::MenuItem("Reset symbol map")) {
+						g_symbolMap->Clear();
+						// NotifyDebuggerMapLoaded();
+					}
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("Memory")) {
+					for (int i = 0; i < 4; i++) {
+						char title[64];
+						snprintf(title, sizeof(title), "Memory %d", i + 1);
+						ImGui::MenuItem(title, nullptr, &cfg_.memViewOpen[i]);
+					}
+					ImGui::MenuItem("Memory Dumper", nullptr, &cfg_.memDumpOpen);
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("OS HLE")) {
+					ImGui::MenuItem("HLE module browser", nullptr, &cfg_.hleModulesOpen);
+					ImGui::MenuItem("File System Browser", nullptr, &cfg_.filesystemBrowserOpen);
+					ImGui::MenuItem("Kernel Objects", nullptr, &cfg_.kernelObjectsOpen);
+					ImGui::MenuItem("Threads", nullptr, &cfg_.threadsOpen);
+					ImGui::MenuItem("Modules", nullptr, &cfg_.modulesOpen);
+					ImGui::MenuItem("Utility Modules", nullptr, &cfg_.utilityModulesOpen);
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("Graphics")) {
+					ImGui::MenuItem("GE Debugger", nullptr, &cfg_.geDebuggerOpen);
+					ImGui::MenuItem("GE State", nullptr, &cfg_.geStateOpen);
+					ImGui::MenuItem("GE Vertices", nullptr, &cfg_.geVertsOpen);
+					ImGui::MenuItem("Display Output", nullptr, &cfg_.displayOpen);
+					ImGui::MenuItem("Textures", nullptr, &cfg_.texturesOpen);
+					ImGui::MenuItem("Framebuffers", nullptr, &cfg_.framebuffersOpen);
+					ImGui::MenuItem("Pixel Viewer", nullptr, &cfg_.pixelViewerOpen);
+					// More to come here...
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("Audio/Video")) {
+					ImGui::MenuItem("SasAudio mixer", nullptr, &cfg_.sasAudioOpen);
+					ImGui::MenuItem("Raw audio channels", nullptr, &cfg_.audioChannelsOpen);
+					ImGui::MenuItem("AV Decoder contexts", nullptr, &cfg_.mediaDecodersOpen);
+					ImGui::Separator();
+					ImGui::MenuItem("Audio output / buffer", nullptr, &cfg_.audioOutOpen);
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("Network")) {
+					ImGui::MenuItem("ApCtl", nullptr, &cfg_.apctlOpen);
+					ImGui::MenuItem("Sockets", nullptr, &cfg_.socketsOpen);
+					ImGui::MenuItem("NP", nullptr, &cfg_.npOpen);
+					ImGui::MenuItem("AdHoc", nullptr, &cfg_.adhocOpen);
+					ImGui::EndMenu();
 				}
 			}
-			ImGui::MenuItemInverted("Break on load", nullptr, &g_Config.bAutoRun);
-			ImGui::MenuItem("Ignore bad memory accesses", nullptr, &g_Config.bIgnoreBadMemAccess);
-			ImGui::MenuItem("Break on frame timeout", nullptr, &g_Config.bBreakOnFrameTimeout);
-			ImGui::MenuItem("Fast memory", nullptr, &g_Config.bFastMemory);
-			ImGui::MenuItem("Auto save/load symbols (PSP/SYSTEM/SYMBOLS)", nullptr, &g_Config.bAutoSaveLoadSymbols);
-			ImGui::Separator();
-			if (ImGui::MenuItem("Take screenshot")) {
-				TakeUserScreenshot();
-			}
-			ImGui::MenuItem("Save screenshot as .png", nullptr, &g_Config.bScreenshotsAsPNG);
-			if (ImGui::MenuItem("Restart graphics")) {
-				System_PostUIMessage(UIMessage::RESTART_GRAPHICS);
-			}
-			if (System_GetPropertyBool(SYSPROP_HAS_TEXT_CLIPBOARD)) {
-				if (ImGui::MenuItem("Copy memory base to clipboard")) {
-					System_CopyStringToClipboard(StringFromFormat("%016llx", (uint64_t)(uintptr_t)Memory::base));
-				}
-			}
-			ImGui::Separator();
-			if (ImGui::MenuItem("Open web debugger")) {
-				OpenWebDebugger();
-			}
-			ImGui::Separator();
-			if (ImGui::MenuItem("Close")) {
-				g_Config.bShowImDebugger = false;
-			}
-			ImGui::EndMenu();
-		}
 
-		/*
-		if (ImGui::BeginMenu("Options")) {
-			ImGui::EndMenu();
-		}
-		*/
-
-		if (showDebugger) {
-			if (ImGui::BeginMenu("Core")) {
-				ImGui::MenuItem("Scheduler", nullptr, &cfg_.schedulerOpen);
-				ImGui::MenuItem("Time", nullptr, &cfg_.timeOpen);
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("CPU")) {
-				ImGui::MenuItem("CPU debugger", nullptr, &cfg_.disasmOpen);
-				ImGui::MenuItem("GPR regs", nullptr, &cfg_.gprOpen);
-				ImGui::MenuItem("FPR regs", nullptr, &cfg_.fprOpen);
-				ImGui::MenuItem("VFPU regs", nullptr, &cfg_.vfpuOpen);
+			if (ImGui::BeginMenu("Tools")) {
+				ImGui::MenuItem("Lua Console", nullptr, &cfg_.luaConsoleOpen);
+				ImGui::MenuItem("Log", nullptr, &cfg_.logOpen);
+				ImGui::MenuItem("Log channels", nullptr, &cfg_.logConfigOpen);
+				ImGui::MenuItem("Debug stats", nullptr, &cfg_.debugStatsOpen);
 				ImGui::Separator();
-				ImGui::MenuItem("Callstacks", nullptr, &cfg_.callstackOpen);
-				ImGui::MenuItem("Breakpoints", nullptr, &cfg_.breakpointsOpen);
-				ImGui::MenuItem("Watch", nullptr, &cfg_.watchOpen);
-				ImGui::MenuItem("JIT viewer", nullptr, &cfg_.jitViewerOpen);
+				if (PSP_IsInited()) {
+					ImGui::MenuItem("ParamSFO viewer", nullptr, &cfg_.paramSFOOpen);
+				}
+				ImGui::MenuItem("Struct viewer", nullptr, &cfg_.structViewerOpen);
+				ImGui::MenuItem("Atrac Tool", nullptr, &cfg_.atracToolOpen);
 				ImGui::EndMenu();
 			}
-			if (ImGui::BeginMenu("Symbols")) {
-				ImGui::MenuItem("Symbol browser", nullptr, &cfg_.symbolsOpen);
-				ImGui::Separator();
 
-				if (ImGui::MenuItem("Load .ppmap...")) {
-					System_BrowseForFile(reqToken_, "Load PPSSPP symbol map", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
-						Path path(responseString);
-						if (!g_symbolMap->LoadSymbolMap(path)) {
-							ERROR_LOG(Log::Common, "Failed to load symbol map");
-						}
-					});
-				}
-				if (ImGui::MenuItem("Save .ppmap...")) {
-					System_BrowseForFileSave(reqToken_, "Save PPSSPP symbol map", "symbols.ppmap", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
-						Path path(responseString);
-						if (!g_symbolMap->SaveSymbolMap(path)) {
-							ERROR_LOG(Log::Common, "Failed to save symbol map");
-						}
-					});
-				}
-				if (ImGui::MenuItem("Load No$ .sym...")) {
-					System_BrowseForFile(reqToken_, "Load No$ symbol map", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
-						Path path(responseString);
-						if (!g_symbolMap->LoadNocashSym(path)) {
-							ERROR_LOG(Log::Common, "Failed to load No$ symbol map");
-						}
-					});
-				}
-				if (ImGui::MenuItem("Save No$ .sym...")) {
-					System_BrowseForFileSave(reqToken_, "Save No$ symbol map", "symbols.sym", BrowseFileType::SYMBOL_MAP, [](std::string_view responseString, int) {
-						Path path(responseString);
-						if (!g_symbolMap->SaveNocashSym(path)) {
-							ERROR_LOG(Log::Common, "Failed to save No$ symbol map");
-						}
-					});
-				}
-				ImGui::Separator();
-				ImGui::MenuItem("Compress .ppmap files", nullptr, &g_Config.bCompressSymbols);
-				if (ImGui::MenuItem("Reset symbol map")) {
-					g_symbolMap->Clear();
-					// NotifyDebuggerMapLoaded();
-				}
+			if (ImGui::BeginMenu("Misc")) {
+				ImGui::MenuItem("PPSSPP Internals", nullptr, &cfg_.internalsOpen);
+				ImGui::MenuItem("Dear ImGui Demo", nullptr, &cfg_.demoOpen);
+				ImGui::MenuItem("Dear ImGui Style editor", nullptr, &cfg_.styleEditorOpen);
 				ImGui::EndMenu();
 			}
-			if (ImGui::BeginMenu("Memory")) {
-				for (int i = 0; i < 4; i++) {
-					char title[64];
-					snprintf(title, sizeof(title), "Memory %d", i + 1);
-					ImGui::MenuItem(title, nullptr, &cfg_.memViewOpen[i]);
-				}
-				ImGui::MenuItem("Memory Dumper", nullptr, &cfg_.memDumpOpen);
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("OS HLE")) {
-				ImGui::MenuItem("HLE module browser", nullptr, &cfg_.hleModulesOpen);
-				ImGui::MenuItem("File System Browser", nullptr, &cfg_.filesystemBrowserOpen);
-				ImGui::MenuItem("Kernel Objects", nullptr, &cfg_.kernelObjectsOpen);
-				ImGui::MenuItem("Threads", nullptr, &cfg_.threadsOpen);
-				ImGui::MenuItem("Modules", nullptr, &cfg_.modulesOpen);
-				ImGui::MenuItem("Utility Modules", nullptr, &cfg_.utilityModulesOpen);
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("Graphics")) {
-				ImGui::MenuItem("GE Debugger", nullptr, &cfg_.geDebuggerOpen);
-				ImGui::MenuItem("GE State", nullptr, &cfg_.geStateOpen);
-				ImGui::MenuItem("GE Vertices", nullptr, &cfg_.geVertsOpen);
-				ImGui::MenuItem("Display Output", nullptr, &cfg_.displayOpen);
-				ImGui::MenuItem("Textures", nullptr, &cfg_.texturesOpen);
-				ImGui::MenuItem("Framebuffers", nullptr, &cfg_.framebuffersOpen);
-				ImGui::MenuItem("Pixel Viewer", nullptr, &cfg_.pixelViewerOpen);
-				// More to come here...
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("Audio/Video")) {
-				ImGui::MenuItem("SasAudio mixer", nullptr, &cfg_.sasAudioOpen);
-				ImGui::MenuItem("Raw audio channels", nullptr, &cfg_.audioChannelsOpen);
-				ImGui::MenuItem("AV Decoder contexts", nullptr, &cfg_.mediaDecodersOpen);
-				ImGui::Separator();
-				ImGui::MenuItem("Audio output / buffer", nullptr, &cfg_.audioOutOpen);
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("Network")) {
-				ImGui::MenuItem("ApCtl", nullptr, &cfg_.apctlOpen);
-				ImGui::MenuItem("Sockets", nullptr, &cfg_.socketsOpen);
-				ImGui::MenuItem("NP", nullptr, &cfg_.npOpen);
-				ImGui::MenuItem("AdHoc", nullptr, &cfg_.adhocOpen);
-				ImGui::EndMenu();
-			}
-		}
 
-		if (ImGui::BeginMenu("Tools")) {
-			ImGui::MenuItem("Lua Console", nullptr, &cfg_.luaConsoleOpen);
-			ImGui::MenuItem("Log", nullptr, &cfg_.logOpen);
-			ImGui::MenuItem("Log channels", nullptr, &cfg_.logConfigOpen);
-			ImGui::MenuItem("Debug stats", nullptr, &cfg_.debugStatsOpen);
-			ImGui::Separator();
-			if (PSP_IsInited()) {
-				ImGui::MenuItem("ParamSFO viewer", nullptr, &cfg_.paramSFOOpen);
+			if (compact) {
+				ImGui::EndMenu();
 			}
-			ImGui::MenuItem("Struct viewer", nullptr, &cfg_.structViewerOpen);
-			ImGui::MenuItem("Atrac Tool", nullptr, &cfg_.atracToolOpen);
-			ImGui::EndMenu();
-		}
-
-		if (ImGui::BeginMenu("Misc")) {
-			ImGui::MenuItem("PPSSPP Internals", nullptr, &cfg_.internalsOpen);
-			ImGui::MenuItem("Dear ImGui Demo", nullptr, &cfg_.demoOpen);
-			ImGui::MenuItem("Dear ImGui Style editor", nullptr, &cfg_.styleEditorOpen);
-			ImGui::EndMenu();
 		}
 
 		if (ImGui::MenuItem("Close")) {
 			g_Config.bShowImDebugger = false;
 		}
-		switch (coreState) {
-		case CoreState::CORE_STEPPING_CPU:
-			if (ImGui::MenuItem(">> Run")) {
-				Core_Resume();
-			}
-			break;
-		case CoreState::CORE_RUNNING_CPU:
-			if (ImGui::MenuItem("|| Break")) {
-				Core_Break(BreakReason::DebugBreak);
-			}
-			break;
-		default:
-			break;
+		if (!compact) {
+			DrawRunBreakItems(coreState);
 		}
+		DrawCoreStatus(coreState);
 		ImGui::EndMainMenuBar();
 	}
 
@@ -3222,4 +3477,6 @@ void ImConfig::SyncConfig(IniFile *ini, bool save) {
 	sync.SetSection(ini->GetOrCreateSection("Settings"));
 	sync.Sync("displayLatched", &displayLatched, false);
 	sync.Sync("realtimePixelPreview", &realtimePixelPreview, false);
+	// Phones and tablets get the touch-friendly layout by default.
+	sync.Sync("touchMode", &touchMode, System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_MOBILE);
 }
